@@ -1,0 +1,197 @@
+def CONTAINER_REGISTRY ="labcase.softwareag.com"
+def CONTAINER_REGISTRY_PORT = "9082"
+def PROJECT_ID_ISISO_ASSETS = "215"
+def REPO_ID_ISISO_107 = "267"
+
+
+pipeline { 
+    agent { label '' } 
+	
+    options {
+        skipStagesAfterUnstable()
+    }
+	
+    stages {
+        stage('Gather deployment parameters') { 
+            steps { 
+			    script {
+						//Obtain the branch from where the image to be created
+						input_params = input message: 'Please Provide Parameters', 
+						                     ok: 'Next', 
+											 parameters: [string(defaultValue: 'development', 
+											                     description: 'Please enter the branch name from where the image to be generated', 
+																 name: 'Branch', 
+																 trim: true)													 
+														]												  
+			    }				
+            }
+        }	
+		
+		stage('Checkout Source Code'){		    
+				steps {
+						script {														  					   								
+								
+								//Initialize variables
+								latestTag = ""
+                                commitID = ""                                
+								
+								/* Repo - isiso_assets, Branch - <enter the branch> */
+								//---------------------------------------------------------//																								
+								repourl = "https://${CONTAINER_REGISTRY}/labcase/testnew.git"							
+								
+                                //Create a temp directory to hold isiso_assets repo
+								sh label: '', script: "mkdir ${workspace}/all_assets"									
+																  
+                                //checkout into the folder
+                                dir("${workspace}/all_assets")
+								{
+									
+									scmVars = checkout poll: false, 
+													   scm: [$class: 'GitSCM', 
+															 branches: [[name: "${input_params}"]], 
+															 doGenerateSubmoduleConfigurations: false, 
+															 extensions: [], 
+															 submoduleCfg: [], 
+															 userRemoteConfigs: [[credentialsId: 'gitlab_upload_registry_all_groups_cred', url: repourl]]
+														   ]
+
+						        }
+								
+							   //Latest tag does not exists, create using the formula , latestTag = LatestBaseImage + CommitID_API
+								if (latestTag == "")
+								{
+									
+									withCredentials([usernamePassword(credentialsId: 'softwareag_gitlab_api_token', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')]) 
+									{
+										sh """
+											 curl -k --header "PRIVATE-TOKEN: ${TOKEN}" 'https://${CONTAINER_REGISTRY}/api/v4/projects/${PROJECT_ID_ISISO_ASSETS}/registry/repositories/${REPO_ID_ISISO_107}/tags' > image_version
+										   """
+									}
+									
+									def json = readJSON file:'image_version'
+									
+									if (json)
+									{									    
+										def lst = json.name
+										def newlst = lst.sort();
+										latestImageVersion = newlst[newlst.size()-1].toString().split('-')[0];									
+									}
+									else
+									{
+										error "SAG softwareag/all_assets/isiso-10.7 base image does not exists"
+									}
+								}
+
+                                commitID = scmVars.GIT_COMMIT
+													
+								latestTag = "${latestImageVersion}" + "-" + commitID.take(7)
+																
+							  }
+					    }
+        }		
+			
+		stage('Build Image') {
+		    steps {
+			    script {					
+					
+                    dockerfile = "Dockerfile_ISISO_Pkg"
+					
+					withCredentials([usernamePassword(credentialsId: 'softwareag_gitlab_api_token', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')])   
+					{										
+						sh """
+							docker login -u "${USERNAME}" -p "${TOKEN}" "${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}"
+							
+							docker build --build-arg BASE_IMAGE_VERSION=${latestImageVersion} --build-arg CONTAINER_REGISTRY=${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT} -t ${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}/softwareag/isiso_assets/isiso-10.7:${latestTag} -f ${workspace}/${dockerfile} .
+						"""
+					}
+				}
+			}
+		}
+		
+		stage('Push Image') {
+		    steps {
+			    script {				
+					
+					withCredentials([usernamePassword(credentialsId: 'softwareag_gitlab_api_token', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')])   
+					{										
+						sh """
+							docker login -u "${USERNAME}" -p "${TOKEN}" "${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}"
+							
+							docker push ${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}/softwareag/isiso_assets/isiso-10.7:${latestTag}
+						"""
+					}
+				
+					//Delete the image which is created on the local docker instance					
+					if (latestTag != "")
+					{
+						def imageID = ""
+						
+						//For removing the Build image from the agent
+						imageID = sh(label: '', returnStdout: true, script: "echo `docker images -q \"${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}/softwareag/isiso_assets/isiso-10.7:${latestTag}\"`").toString().trim()				
+						
+						if (imageID != "")
+						{
+							sh """
+								docker rmi -f ${imageID}
+							"""
+						}		
+
+						//For removing the Base image from the agent
+						imageID = sh(label: '', returnStdout: true, script: "echo `docker images -q \"${CONTAINER_REGISTRY}:${CONTAINER_REGISTRY_PORT}/softwareag/isiso_assets/isiso-10.7:${latestImageVersion}\"`").toString().trim()				
+						
+						if (imageID != "")
+						{
+							sh """
+								docker rmi -f ${imageID}
+							"""
+						}							
+					}
+				
+				}	
+
+				//Create git tag and push
+				dir("${workspace}/isiso_assets") {																		
+						
+					withCredentials([usernamePassword(credentialsId: 'softwareag_gitlab_api_token', usernameVariable: 'USERNAME', passwordVariable: 'TOKEN')])   
+					{
+						
+                        script {
+						   repourl = "${CONTAINER_REGISTRY}/softwareag/isiso_assets.git"
+                        }						
+						
+						sh """
+							git config user.email "natarajan.ramachandran@softwareag.com"
+							git config user.name "Natarajan Ramchandran"	
+                            git tag -f -m \"\" ${latestTag}							
+							git push -f https://\"${USERNAME}:${TOKEN}\"@${repourl} ${latestTag}
+						"""
+					}
+				}                
+                
+			}
+		}				
+	}
+	
+	post {   	  
+        cleanup {				
+			/* clean up our workspace */
+			deleteDir()
+			
+			/* clean up tmp directory */
+			dir("${workspace}@tmp") {
+				deleteDir()
+			}	
+
+			/* clean up script directory */
+			dir("${workspace}@script") {
+				deleteDir()
+			}		
+
+			/* clean up script tmp directory */
+			dir("${workspace}@script@tmp") {
+				deleteDir()
+			}
+        }	  
+	  
+	}	
+}
